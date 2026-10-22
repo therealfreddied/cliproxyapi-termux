@@ -123,7 +123,13 @@ actual="$(sha256sum "$TARBALL" | cut -d' ' -f1)"
   got      $actual"
 ok "sha256 verified"
 
-tar tzf "$TARBALL" 2>/dev/null | grep -qE '(^/|(^|/)\.\.(/|$))' && die "tarball has unsafe paths"
+# awk reads the whole listing (no SIGPIPE), so under pipefail this fires
+# correctly. `tar ... | grep -q pattern && die` does NOT: grep exits early,
+# tar dies of SIGPIPE, the pipeline reports failure, and the guard silently
+# never runs - which would let a tarbomb through.
+if tar tzf "$TARBALL" 2>/dev/null | awk '/(^\/)|(^|\/)\.\.($|\/)/{found=1} END{exit !found}'; then
+  die "tarball has unsafe paths"
+fi
 
 mkdir -p "$TMPD/x"
 tar xzf "$TARBALL" -C "$TMPD/x" || die "extract failed"
@@ -132,13 +138,33 @@ NEWBIN="$(find "$TMPD/x" -type f -name 'cli-proxy-api' -print -quit)"
 [ -n "$NEWBIN" ] || die "cli-proxy-api not found inside tarball"
 NEWWRAP="$(find "$TMPD/x" -type f -name 'cliproxy' -print -quit)"
 
-file "$NEWBIN" | grep -q 'ELF 64-bit LSB.*ARM aarch64' || die "not an aarch64 ELF"
-readelf -l "$NEWBIN" 2>/dev/null | grep -q INTERP && die "binary is not static"
-[ "$(readelf -d "$NEWBIN" 2>/dev/null | grep -c NEEDED)" -eq 0 ] || die "binary has DT_NEEDED"
-S="$(strings -a "$NEWBIN")"
-printf '%s' "$S" | grep -q "$PREFIX/etc/resolv.conf"  || die "resolv patch missing"
-printf '%s' "$S" | grep -q "$PREFIX/etc/tls/cert.pem" || die "CA patch missing"
-printf '%s' "$S" | grep -q "$PREFIX/tmp"              || die "tempdir patch missing"
+FILE_OUT="$(file "$NEWBIN" 2>/dev/null || true)"
+PROG_OUT="$(readelf -l "$NEWBIN" 2>/dev/null || true)"
+DYN_OUT="$(readelf -d "$NEWBIN" 2>/dev/null || true)"
+S="$(strings -a "$NEWBIN" 2>/dev/null || true)"
+
+case "$FILE_OUT" in
+  *"ELF 64-bit LSB"*"ARM aarch64"*) ;;
+  *) die "not an aarch64 ELF" ;;
+esac
+case "$PROG_OUT" in
+  *INTERP*) die "binary is not static" ;;
+esac
+case "$DYN_OUT" in
+  *NEEDED*) die "binary has DT_NEEDED" ;;
+esac
+case "$S" in
+  *"$PREFIX/etc/resolv.conf"*)  ;;
+  *) die "resolv patch missing" ;;
+esac
+case "$S" in
+  *"$PREFIX/etc/tls/cert.pem"*) ;;
+  *) die "CA patch missing" ;;
+esac
+case "$S" in
+  *"$PREFIX/tmp"*) ;;
+  *) die "tempdir patch missing" ;;
+esac
 ok "artifact verified (static aarch64, 3/3 patches)"
 
 # ------------------------------------------------------------------- install

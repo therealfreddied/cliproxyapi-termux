@@ -56,10 +56,10 @@ python3 "$REPO_ROOT/scripts/make-overlay.py" \
   --out "$OVL"
 
 # ---------------------------------------------------------------------- build
-EXTRA_LDFLAGS=""
-if [ -f "$REPO_ROOT/VERSION_BUILD" ]; then
-  EXTRA_LDFLAGS="-X main.Version=$(cat "$REPO_ROOT/VERSION_BUILD")"
-fi
+# The version string is ALWAYS set. Do not make this conditional: an empty
+# -X main.Version leaves Go's default "dev", which breaks the launcher's
+# update comparison (and its rollback, which parses the banner).
+BUILD_VERSION="${UPSTREAM_REF}-termux"
 
 log "building (CGO_ENABLED=0 GOOS=linux GOARCH=arm64 GOARM64=$GOARM64_LEVEL)"
 (
@@ -68,7 +68,7 @@ log "building (CGO_ENABLED=0 GOOS=linux GOARCH=arm64 GOARM64=$GOARM64_LEVEL)"
   go build -buildvcs=false -trimpath \
     -overlay "$OVL/overlay.json" \
     -ldflags="-s -w \
-      ${EXTRA_LDFLAGS:+-X main.Version=$UPSTREAM_REF-termux} \
+      -X main.Version=$BUILD_VERSION \
       -X main.Commit=$UPSTREAM_SHA \
       -X main.BuildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     -o "$WORKDIR/cli-proxy-api" ./cmd/server
@@ -76,7 +76,7 @@ log "building (CGO_ENABLED=0 GOOS=linux GOARCH=arm64 GOARM64=$GOARM64_LEVEL)"
 
 # --------------------------------------------------------------------- verify
 log "verifying artifact"
-bash "$REPO_ROOT/scripts/verify.sh" "$WORKDIR/cli-proxy-api" "$PREFIX_BAKED"
+bash "$REPO_ROOT/scripts/verify.sh" "$WORKDIR/cli-proxy-api" "$PREFIX_BAKED" "$BUILD_VERSION"
 
 # -------------------------------------------------------------------- package
 mkdir -p "$DIST"
