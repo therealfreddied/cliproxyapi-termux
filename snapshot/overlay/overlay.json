@@ -2,6 +2,7 @@
   "Replace": {
     "/opt/hostedtoolcache/go/1.27.3/x64/src/net/dnsclient_unix.go": "/home/runner/work/cliproxyapi-termux/cliproxyapi-termux/snapshot/overlay/net_dnsclient_unix.go",
     "/opt/hostedtoolcache/go/1.27.3/x64/src/crypto/x509/root_linux.go": "/home/runner/work/cliproxyapi-termux/cliproxyapi-termux/snapshot/overlay/crypto_x509_root_linux.go",
-    "/opt/hostedtoolcache/go/1.27.3/x64/src/os/file_unix.go": "/home/runner/work/cliproxyapi-termux/cliproxyapi-termux/snapshot/overlay/os_file_unix.go"
+    "/opt/hostedtoolcache/go/1.27.3/x64/src/os/file_unix.go": "/home/runner/work/cliproxyapi-termux/cliproxyapi-termux/snapshot/overlay/os_file_unix.go",
+    "/opt/hostedtoolcache/go/1.27.3/x64/src/syscall/syscall_linux.go": "/home/runner/work/cliproxyapi-termux/cliproxyapi-termux/snapshot/overlay/syscall_syscall_linux.go"
   }
 }
