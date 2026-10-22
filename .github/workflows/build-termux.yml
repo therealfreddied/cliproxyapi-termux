@@ -207,12 +207,32 @@ jobs:
             echo '```'
           } > notes.md
 
-          gh release create "$REF" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "$REF (Termux aarch64)" \
-            --notes-file notes.md \
-            "$tar" "$sum"
-
+          # A force rebuild must be able to REPUBLISH. `gh release create`
+          # alone fails with "a release with the same tag name already
+          # exists", so handle all three states explicitly.
+          if gh release view "$REF" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $REF exists - replacing assets"
+            # Delete existing assets first so stale ones cannot linger.
+            gh release view "$REF" --repo "$GITHUB_REPOSITORY" --json assets \
+              -q '.assets[].name' 2>/dev/null \
+              | while read -r a; do
+                  [ -n "$a" ] || continue
+                  gh release delete-asset "$REF" "$a" \
+                    --repo "$GITHUB_REPOSITORY" --yes >/dev/null 2>&1 || true
+                done
+            gh release upload "$REF" "$tar" "$sum" \
+              --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$REF" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$REF (Termux aarch64)" \
+              --notes-file notes.md
+          else
+            gh release create "$REF" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$REF (Termux aarch64)" \
+              --notes-file notes.md \
+              "$tar" "$sum"
+          fi
       - name: Upload release notes for snapshot step
         uses: actions/upload-artifact@v4
         with:
