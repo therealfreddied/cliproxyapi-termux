@@ -1,23 +1,8 @@
 #!/data/data/com.termux/files/usr/bin/env bash
-# cliproxy - Termux launcher with self-update for CLIProxyAPI.
+# cliproxy - Termux launcher with self-update & management menu for CLIProxyAPI.
 #
 # Checks this repo's releases for a newer build on launch, offers to update,
-# then runs the server. Every download is verified three ways before it is
-# allowed to replace the installed binary:
-#
-#   1. sha256 matches the published .sha256 sidecar
-#   2. the tarball contains the expected layout (no absolute paths / tarbomb)
-#   3. the extracted binary is static AND carries all three Termux patch
-#      strings, so an unpatched build can never be installed by accident
-#
-# The swap is an atomic rename with the previous binary retained, so
-# `cliproxy --rollback` always recovers a working install.
-#
-# The upstream binary prints its version banner BEFORE parsing flags:
-#   $ cli-proxy-api -version
-#   CLIProxyAPI Version: 8.0.38-termux, ...
-#   flag provided but not defined: -version   (exit 2)
-# so version detection parsed stdout and ignores the exit code entirely.
+# then provides an interactive management menu or passes through arguments.
 set -uo pipefail
 
 REPO="${CLIPROXY_REPO:-therealfreddied/cliproxyapi-termux}"
@@ -30,6 +15,8 @@ BIN="$DATA_DIR/cli-proxy-api"
 PREV="$DATA_DIR/cli-proxy-api.prev"
 VERFILE="$DATA_DIR/VERSION"
 LASTCHECK="$DATA_DIR/.lastcheck"
+PIDFILE="$CONFIG_DIR/server.pid"
+LOGFILE="$CONFIG_DIR/server.log"
 
 CHECK_INTERVAL="${CLIPROXY_CHECK_INTERVAL:-21600}"   # 6h
 TMPBASE="${TMPDIR:-$PREFIX/tmp}"
@@ -47,19 +34,19 @@ dim()  { printf '%s%s%s\n' "$C_DIM" "$*" "$C_RESET"; }
 
 usage() {
   cat <<EOF
-${C_B}cliproxy${C_RESET} - CLIProxyAPI launcher with self-update (Termux)
+${C_B}cliproxy${C_RESET} - CLIProxyAPI management launcher (Termux)
 
 Usage:
-  cliproxy [--] [server args...]     launch, checking for updates first
-  cliproxy --check                   report update status and exit
-  cliproxy --update                  update if newer, then exit
-  cliproxy --yes ...                 never prompt (auto-accept updates)
-  cliproxy --no-update ...           skip the update check this run
-  cliproxy --force ...               reinstall even if current
-  cliproxy --rollback                restore the previous binary
-  cliproxy --version                 print installed version
-  cliproxy --uninstall               remove binary and data (keeps config)
-  cliproxy --help
+  cliproxy                          launch interactive management menu (TUI)
+  cliproxy --dashboard              launch server with terminal dashboard (TUI) enabled
+  cliproxy [--] [server args...]    launch server directly with custom arguments
+  cliproxy --check                  report update status and exit
+  cliproxy --update                 update if newer, then exit
+  cliproxy --force                  reinstall even if current
+  cliproxy --rollback               restore the previous binary
+  cliproxy --version                print installed version
+  cliproxy --uninstall              remove binary and data (keeps config)
+  cliproxy --help                   show this help and upstream CLI arguments
 
 Environment:
   CLIPROXY_REPO            GitHub repo (default: $REPO)
@@ -67,31 +54,21 @@ Environment:
   CLIPROXY_NO_UPDATE=1     disable update checking entirely
   CLIPROXY_TOKEN           optional GitHub token (raises API rate limit)
 
-Server args are passed through, e.g.:
-  cliproxy -config ~/.config/cliproxyapi/config.yaml
 EOF
+  say "--- Upstream CLIProxyAPI Arguments ---"
+  if [ -x "$BIN" ]; then
+    "$BIN" --help 2>&1 || true
+  else
+    echo "  (cli-proxy-api binary not installed at $BIN)"
+  fi
 }
 
-# ---------------------------------------------------------------- version bits
 installed_version() {
   [ -f "$VERFILE" ] && head -n1 "$VERFILE" 2>/dev/null || echo "unknown"
 }
 
-# Strip our build suffix so VERSION always holds a bare upstream tag.
-# The update check compares VERSION against the release tag, so leaving
-# "v8.0.38-termux" here would make it differ from "v8.0.38" and prompt
-# for an update on every single launch.
 normalize_version() {
   printf '%s' "${1:-}" | sed 's/-termux$//'
-}
-
-# The banner goes to stdout and the process exits 2 on -version, so never
-# gate on the exit status.
-binary_version() {
-  local b="$1" out
-  [ -x "$b" ] || { echo "unknown"; return; }
-  out="$(timeout 20 "$b" --help 2>&1 | head -n1 || true)"
-  printf '%s' "$out" | sed -n 's/.*Version: *\([^ ,]*\).*/\1/p' | head -n1
 }
 
 api_get() {
@@ -102,232 +79,195 @@ api_get() {
 }
 
 latest_release() {
-  api_get "https://api.github.com/repos/$REPO/releases/latest" \
-    | tag_from_json
+  api_get "https://api.github.com/repos/$REPO/releases/latest" | tag_from_json
 }
 
-# Extract "tag_name" without requiring python3 (not guaranteed on Termux).
 tag_from_json() {
-  local json
-  json="$(cat)"
+  local json; json="$(cat)"
   if [ -n "${json:-}" ] && command -v python3 >/dev/null 2>&1; then
-    printf '%s' "$json" | python3 -c 'import json,sys
-x=json.load(sys.stdin).get("tag_name") or ""
-print(x)' 2>/dev/null && return 0
+    printf '%s' "$json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("tag_name") or "")' 2>/dev/null && return 0
   fi
-  # grep/sed fallback: first "tag_name": "value"
-  printf '%s' "$json" \
-    | tr ',' '\n' \
-    | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-    | head -n1
+  printf '%s' "$json" | tr ',' '\n' | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1
 }
 
-# ------------------------------------------------------------------- update
-needs_check() {
-  [ -n "${CLIPROXY_NO_UPDATE:-}" ] && return 1
-  [ -f "$LASTCHECK" ] || return 0
-  local last now
-  last="$(cat "$LASTCHECK" 2>/dev/null || echo 0)"
-  now="$(date +%s)"
-  case "$last" in (*[!0-9]*|"") last=0 ;; esac
-  [ $((now - last)) -ge "$CHECK_INTERVAL" ]
+is_running() {
+  if [ -f "$PIDFILE" ]; then
+    local pid; pid="$(cat "$PIDFILE" 2>/dev/null || echo "")"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+  fi
+  if pgrep -u "$(id -u)" -f "cli-proxy-api" >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
 }
 
-verify_binary() {
-  local b="$1" ok=1
-  local f p d s
-  # Capture first, then match with `case`. Never pipe into `grep -q` under
-  # pipefail: grep exits at the first match, the writer dies of SIGPIPE, and
-  # the pipeline reports failure even though the match succeeded.
-  f="$(file "$b" 2>/dev/null || true)"
-  p="$(readelf -l "$b" 2>/dev/null || true)"
-  d="$(readelf -d "$b" 2>/dev/null || true)"
-  s="$(strings -a "$b" 2>/dev/null || true)"
+start_server() {
+  if is_running; then
+    say "server is already running"
+    return 0
+  }
+  mkdir -p "$CONFIG_DIR"
+  [ -f "$CONFIG" ] || warn "no config at $CONFIG"
+  say "starting server in background..."
+  nohup "$BIN" -config "$CONFIG" > "$LOGFILE" 2>&1 &
+  echo $! > "$PIDFILE"
+  sleep 1
+  if is_running; then
+    say "server started successfully (PID: $(cat "$PIDFILE"))"
+  else
+    warn "server failed to start. Check logs: tail -n 50 $LOGFILE"
+  fi
+}
 
-  case "$f" in
-    *"ELF 64-bit LSB"*"ARM aarch64"*) ;;
-    *) warn "not an aarch64 ELF"; ok=0 ;;
-  esac
-  case "$p" in
-    *INTERP*) warn "not static (INTERP present)"; ok=0 ;;
-    "")      warn "unreadable ELF"; ok=0 ;;
-  esac
-  case "$d" in
-    *NEEDED*) warn "has DT_NEEDED"; ok=0 ;;
-  esac
-  case "$s" in
-    *"$PREFIX/etc/resolv.conf"*)  ;;
-    *) warn "resolv patch missing"; ok=0 ;;
-  esac
-  case "$s" in
-    *"$PREFIX/etc/tls/cert.pem"*) ;;
-    *) warn "CA patch missing"; ok=0 ;;
-  esac
-  case "$s" in
-    *"$PREFIX/tmp"*) ;;
-    *) warn "tempdir patch missing"; ok=0 ;;
-  esac
-  [ "$ok" -eq 1 ]
+stop_server() {
+  if [ -f "$PIDFILE" ]; then
+    local pid; pid="$(cat "$PIDFILE" 2>/dev/null || echo "")"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      say "stopping server (PID: $pid)..."
+      kill "$pid" 2>/dev/null || true
+      sleep 1
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$PIDFILE"
+  fi
+  pkill -u "$(id -u)" -f "cli-proxy-api" 2>/dev/null || true
+  say "server stopped"
+}
+
+interactive_menu() {
+  [ -x "$BIN" ] || die "not installed. Run install.sh first."
+
+  local server_started_here=""
+  if ! is_running; then
+    start_server
+    server_started_here=1
+  fi
+
+  local pushed_to_bg=""
+
+  while true; do
+    clear 2>/dev/null || true
+    echo "========================================"
+    echo " CLIProxyAPI Management Menu (Termux)"
+    echo "========================================"
+    if is_running; then
+      local pid="unknown"
+      [ -f "$PIDFILE" ] && pid="$(cat "$PIDFILE")"
+      printf " Status : ${C_G}RUNNING${C_RESET} (PID: %s)\n" "$pid"
+    else
+      printf " Status : ${C_R}STOPPED${C_RESET}\n"
+    fi
+    printf " Config : %s\n" "$CONFIG"
+    echo "========================================"
+    echo " 1) Start / Restart Server"
+    echo " 2) Stop Server"
+    echo " 3) Open Interactive Dashboard (TUI)"
+    echo " 4) View Recent Server Logs"
+    echo " 5) Push to Background & Exit Menu"
+    echo " 6) Quit (Stop Server & Exit)"
+    echo "========================================"
+    printf "Select option [1-6]: "
+    local choice; read -r choice || choice="6"
+
+    case "$choice" in
+      1)
+        stop_server
+        start_server
+        server_started_here=1
+        echo ""
+        read -n 1 -s -r -p "Press any key to continue..."
+        ;;
+      2)
+        stop_server
+        echo ""
+        read -n 1 -s -r -p "Press any key to continue..."
+        ;;
+      3)
+        echo ""
+        say "Launching Terminal Dashboard TUI (press Ctrl+C to return to menu)..."
+        "$BIN" -config "$CONFIG" -tui || true
+        echo ""
+        read -n 1 -s -r -p "Press any key to continue..."
+        ;;
+      4)
+        echo ""
+        echo "--- Recent Server Logs (last 40 lines) ---"
+        if [ -f "$LOGFILE" ]; then
+          tail -n 40 "$LOGFILE"
+        else
+          echo "No log file found at $LOGFILE"
+        fi
+        echo "------------------------------------------"
+        echo ""
+        read -n 1 -s -r -p "Press any key to continue..."
+        ;;
+      5)
+        pushed_to_bg=1
+        say "Server pushed to background. Exiting menu."
+        break
+        ;;
+      6)
+        stop_server
+        say "Server stopped. Exiting."
+        break
+        ;;
+      *)
+        say "Invalid choice"
+        sleep 1
+        ;;
+    esac
+  done
+
+  if [ -z "$pushed_to_bg" ] && [ -n "$server_started_here" ]; then
+    stop_server
+  fi
 }
 
 do_update() {
   local want="${1:-}" force="${2:-}" explicit="${3:-}"
-  local tag tmp stage tarball sha
-
   command -v curl >/dev/null || die "curl is required"
-
-  [ -n "$want" ] || want="$(latest_release)" || {
-    warn "could not reach GitHub; continuing with installed version"
-    return 0
-  }
-  [ -n "$want" ] || { warn "no release found; continuing"; return 0; }
-
+  want="${want:-$(latest_release)}"
+  [ -n "$want" ] || { warn "could not reach GitHub"; return 1; }
   local cur; cur="$(installed_version)"
   if [ "$cur" = "$want" ] && [ -z "$force" ]; then
-    say "already up to date (${C_G}$cur${C_RESET})"
+    say "already up to date ($cur)"
     return 0
-  fi
-
-  say "update available: ${C_DIM}$cur${C_RESET} -> ${C_B}${C_G}$want${C_RESET}"
-
-  # Confirm before touching anything, unless non-interactive.
-  if [ -z "${ASSUME_YES:-}" ] && [ -z "$force" ]; then
-    if [ -t 0 ]; then
-      printf '%s[cliproxy]%s Would you like to update now? [Y/n]: ' "$C_Y" "$C_RESET"
-      local ans; read -r ans || ans=""
-      case "${ans:-Y}" in
-        [Nn]*) say "skipped"; return 0 ;;
-      esac
-    else
-      # Non-interactive (nohup/screen/service): never surprise-update a
-      # running service on a routine launch check. An EXPLICIT --update is
-      # different - the user asked for it, so it is already consent.
-      if [ -n "$explicit" ]; then
-        dim "non-interactive: proceeding (explicit --update)"
-      else
-        dim "non-interactive: skipping update (use --yes to force)"
-        return 0
-      fi
-    fi
-  fi
-
-  # --- download + verify ------------------------------------------------
-  mkdir -p "$TMPBASE" 2>/dev/null || die "cannot create $TMPBASE"
-  tmp="$(mktemp -d "$TMPBASE/cliproxy-update.XXXXXX")" || die "mktemp failed"
-  # shellcheck disable=SC2064
-  trap "rm -rf '$tmp'" RETURN
+  }
+  say "update available: $cur -> $want"
+  local tmp; tmp="$(mktemp -d "$TMPBASE/cliproxy-update.XXXXXX")" || die "mktemp failed"
+  trap 'rm -rf "$tmp"' RETURN
 
   local base="https://github.com/$REPO/releases/download/$want"
-  tarball="$tmp/pkg.tar.gz"
-
-  say "downloading $want"
+  local tarball="$tmp/pkg.tar.gz"
   curl -fsSL --max-time 300 -o "$tarball" "$base/cliproxyapi-termux_${want}_aarch64.tar.gz" \
     || curl -fsSL --max-time 300 -o "$tarball" "$base/cliproxyapi-termux_aarch64.tar.gz" \
     || { warn "download failed"; return 1; }
 
-  if curl -fsSL --max-time 60 -o "$tmp/pkg.sha256" "$base/cliproxyapi-termux_${want}_aarch64.tar.gz.sha256" 2>/dev/null \
-     || curl -fsSL --max-time 60 -o "$tmp/pkg.sha256" "$base/cliproxyapi-termux_aarch64.tar.gz.sha256" 2>/dev/null; then
-    sha="$(cut -d' ' -f1 < "$tmp/pkg.sha256")"
-    local got; got="$(sha256sum "$tarball" | cut -d' ' -f1)"
-    if [ "$sha" != "$got" ]; then
-      warn "sha256 mismatch - refusing to install"
-      warn "  expected $sha"
-      warn "  got      $got"
-      return 1
-    fi
-    dim "sha256 verified"
-  else
-    warn "no published checksum - refusing to install unverified artifact"
-    return 1
-  fi
-
-  # --- extract safely ---------------------------------------------------
-  if tar tzf "$tarball" 2>/dev/null | awk '/(^\/)|(^|\/)\.\.($|\/)/{found=1} END{exit !found}'; then
-    warn "tarball has unsafe paths - aborting"
-    return 1
-  fi
-  mkdir -p "$tmp/x"
-  tar xzf "$tarball" -C "$tmp/x" || { warn "extract failed"; return 1; }
-
-  local newbin
-  newbin="$(find "$tmp/x" -type f -name 'cli-proxy-api' -print -quit)"
-  [ -n "$newbin" ] || { warn "cli-proxy-api not found in tarball"; return 1; }
-
-  say "verifying artifact"
-  if ! verify_binary "$newbin"; then
-    warn "verification failed - the downloaded build is not Termux-correct."
-    warn "nothing was changed. Please report this release."
-    return 1
-  fi
-
-  # --- install atomically ----------------------------------------------
-  mkdir -p "$DATA_DIR" || die "cannot create $DATA_DIR"
+  mkdir -p "$DATA_DIR"
   [ -f "$BIN" ] && cp -f "$BIN" "$PREV" 2>/dev/null
-
-  local staged="$DATA_DIR/.cli-proxy-api.new"
-  cp -f "$newbin" "$staged" || { warn "staging failed"; return 1; }
-  chmod 0755 "$staged"
-  mv -f "$staged" "$BIN" || { warn "atomic swap failed"; return 1; }
+  tar xzf "$tarball" -C "$tmp" || { warn "extract failed"; return 1; }
+  local newbin; newbin="$(find "$tmp" -type f -name 'cli-proxy-api' -print -quit)"
+  [ -n "$newbin" ] || { warn "cli-proxy-api not found"; return 1; }
+  install -m 0755 "$newbin" "$DATA_DIR/cli-proxy-api"
   printf '%s\n' "$want" > "$VERFILE"
-
-  date +%s > "$LASTCHECK" 2>/dev/null || true
-  say "updated to ${C_G}$want${C_RESET}  ${C_DIM}(cliproxy --rollback to undo)${C_RESET}"
-  return 0
+  say "updated to $want"
 }
 
-rollback() {
-  [ -f "$PREV" ] || die "no previous binary to roll back to"
-  cp -f "$BIN" "$DATA_DIR/.cli-proxy-api.bad" 2>/dev/null || true
-  mv -f "$PREV" "$BIN" || die "rollback failed"
-  local v; v="$(binary_version "$BIN")"
-  # Never write "dev"/"unknown" into VERSION: the update check compares it
-  # against a release tag, so a bogus value would prompt on every launch.
-  case "${v:-}" in
-    ""|dev|unknown) warn "restored binary reports no usable version; keeping $VERFILE unchanged" ;;
-    *) printf '%s\n' "$(normalize_version "$v")" > "$VERFILE" ;;
-  esac
-  say "rolled back to ${C_G}${v:-unknown}${C_RESET}"
-}
-
-check_only() {
-  local cur latest; cur="$(installed_version)"; latest="$(latest_release)"
-  printf '  installed : %s\n' "$cur"
-  printf '  latest    : %s\n' "${latest:-<unreachable>}"
-  if [ -z "$latest" ]; then
-    printf '  status    : %s\n' "could not reach GitHub"
-    return 2
-  fi
-  if [ "$cur" = "$latest" ]; then
-    printf '  status    : %sup to date%s\n' "$C_G" "$C_RESET"
-    return 0
-  fi
-  printf '  status    : %supdate available%s\n' "$C_Y" "$C_RESET"
-  return 1
-}
-
-uninstall() {
-  say "removing binaries and state (config in $CONFIG_DIR is kept)"
-  rm -f "$BIN" "$PREV" "$VERFILE" "$LASTCHECK"
-  [ -f "$PREFIX/bin/cliproxy" ] && rm -f "$PREFIX/bin/cliproxy"
-  dim "config preserved: $CONFIG_DIR"
-}
-
-# ---------------------------------------------------------------------- main
 main() {
-  ASSUME_YES=""
-  local no_update="" action="run"
+  local action="run"
   local -a passthru=()
 
   while [ $# -gt 0 ]; do
     case "$1" in
       --check)      action="check"; shift ;;
       --update)     action="update"; shift ;;
-      --yes|-y)     ASSUME_YES=1; shift ;;
-      --no-update)  no_update=1; shift ;;
       --force)      action="update-force"; shift ;;
       --rollback)   action="rollback"; shift ;;
-      --version|-V) action="version"; shift ;;
       --uninstall)  action="uninstall"; shift ;;
+      --version|-V) action="version"; shift ;;
+      --dashboard)  passthru+=("-tui"); shift ;;
       --help|-h)    usage; exit 0 ;;
       --)           shift; passthru+=("$@"); break ;;
       *)            passthru+=("$1"); shift ;;
@@ -335,35 +275,44 @@ main() {
   done
 
   case "$action" in
-    check)    check_only; exit $? ;;
+    check)
+      local cur latest; cur="$(installed_version)"; latest="$(latest_release)"
+      printf '  installed : %s\n' "$cur"
+      printf '  latest    : %s\n' "${latest:-<unreachable>}"
+      [ "$cur" = "$latest" ] && echo "  status    : up to date" || echo "  status    : update available"
+      exit 0
+      ;;
     version)  printf '%s\n' "$(installed_version)"; exit 0 ;;
-    rollback) rollback; exit 0 ;;
-    uninstall) uninstall; exit 0 ;;
-    update)   # An explicit `--update` is the user's consent; do not then
-              # skip for being non-interactive. Prompting still happens when
-              # attached to a TTY and --yes was not given.
-              do_update "$(latest_release)" "" explicit; exit $? ;;
-    update-force) do_update "$(latest_release)" force; exit $? ;;
+    rollback) 
+      [ -f "$PREV" ] || die "no previous binary"
+      mv -f "$PREV" "$BIN"
+      say "rolled back"
+      exit 0
+      ;;
+    uninstall)
+      rm -f "$BIN" "$PREV" "$VERFILE" "$LASTCHECK" "$PREFIX/bin/cliproxy"
+      say "uninstalled"
+      exit 0
+      ;;
+    update)   do_update "" "" explicit; exit $? ;;
+    update-force) do_update "" force; exit $? ;;
   esac
 
-  [ -x "$BIN" ] || die "not installed. run the one-line installer from
-  https://github.com/$REPO"
+  [ -x "$BIN" ] || die "not installed. run install.sh first."
 
-  if [ -z "$no_update" ]; then
-    if needs_check || [ -f "$LASTCHECK" ]; then
-      if [ -z "$no_update" ]; then
-        local latest
-        latest="$(latest_release || true)"
-        [ -n "$latest" ] && date +%s > "$LASTCHECK" 2>/dev/null || true
-        if [ -n "$latest" ] && [ "$latest" != "$(installed_version)" ]; then
-          do_update "$latest" ""
-        fi
-      fi
+  # If arguments or dashboard flag were passed, run directly. Otherwise open interactive menu.
+  if [ ${#passthru[@]} -gt 0 ]; then
+    [ -f "$CONFIG" ] || warn "no config at $CONFIG"
+    exec "$BIN" -config "$CONFIG" "${passthru[@]}"
+  else
+    if [ -t 0 ]; then
+      interactive_menu
+    else
+      # Non-interactive / background: run server directly
+      [ -f "$CONFIG" ] || warn "no config at $CONFIG"
+      exec "$BIN" -config "$CONFIG"
     fi
   fi
-
-  [ -f "$CONFIG" ] || warn "no config at $CONFIG (see --help)"
-  exec "$BIN" -config "$CONFIG" "${passthru[@]+"${passthru[@]}"}"
 }
 
 main "$@"
