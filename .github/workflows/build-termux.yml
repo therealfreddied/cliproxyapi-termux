@@ -1,0 +1,264 @@
+name: build-termux
+
+# Watches upstream CLIProxyAPI and republishes a Termux-native build.
+#
+# Upstream ships frequently (v8.0.31 -> v8.0.38 in one week, sometimes two
+# releases per day), so this runs on a 6-hourly schedule rather than on
+# upstream webhooks. Each run:
+#
+#   1. resolves the newest upstream release tag
+#   2. exits early if this repo already published that version
+#   3. checks out upstream source at that tag
+#   4. patches Go's stdlib via `go build -overlay` (GOROOT is never mutated)
+#   5. cross-compiles a static aarch64 binary
+#   6. refuses to publish unless every Termux patch is proven present
+#   7. publishes a GitHub Release with the tarball + sha256 sidecar
+#   8. optionally commits the patched source snapshot back to the repo
+#
+# The release asset naming is what the `cliproxy` wrapper resolves against,
+# so changing it requires changing the wrapper too.
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Upstream tag to build (blank = newest release)"
+        required: false
+        default: ""
+      force:
+        description: "Rebuild even if this version is already published"
+        type: boolean
+        default: false
+      commit_snapshot:
+        description: "Commit patched source snapshot back to the repo"
+        type: boolean
+        default: true
+  push:
+    branches: [main]
+    paths:
+      - "scripts/**"
+      - "wrapper/**"
+      - ".github/workflows/**"
+      - "install.sh"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-termux
+  cancel-in-progress: false
+
+env:
+  # Pinned to the Go version the Termux `golang` package ships, so a CI
+  # build and an on-device build use an identical toolchain. Bump this
+  # when Termux bumps theirs (check: pkg show golang).
+  GO_VERSION: "1.27.3"
+  TERMUX_PREFIX: "/data/data/com.termux/files/usr"
+
+jobs:
+  resolve:
+    name: resolve upstream version
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.pick.outputs.ref }}
+      sha: ${{ steps.pick.outputs.sha }}
+      skip: ${{ steps.gate.outputs.skip }}
+    steps:
+      - name: Choose target upstream ref
+        id: pick
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_REF: ${{ inputs.upstream_ref }}
+        run: |
+          set -euo pipefail
+          ref="${INPUT_REF:-}"
+          if [ -z "$ref" ]; then
+            ref="$(curl -fsSL --max-time 30 \
+              -H "Accept: application/vnd.github+json" \
+              https://api.github.com/repos/router-for-me/CLIProxyAPI/releases/latest \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')"
+          fi
+          [ -n "$ref" ] || { echo "could not resolve upstream ref"; exit 1; }
+          sha="$(curl -fsSL --max-time 30 \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/router-for-me/CLIProxyAPI/git/ref/tags/$ref" \
+            | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["object"]["sha"][:12])' 2>/dev/null || echo unknown)"
+          echo "ref=$ref"   >> "$GITHUB_OUTPUT"
+          echo "sha=$sha"   >> "$GITHUB_OUTPUT"
+          echo "target: $ref ($sha)"
+
+      - name: Skip if already published
+        id: gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REF: ${{ steps.pick.outputs.ref }}
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.force }}" = "true" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "force requested"
+            exit 0
+          fi
+          if gh release view "$REF" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "release $REF already exists - nothing to do"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "release $REF not present - will build"
+          fi
+
+  build:
+    name: build + verify
+    needs: resolve
+    if: needs.resolve.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Set up Go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Show toolchain
+        run: |
+          go version
+          python3 --version
+
+      - name: Build
+        env:
+          UPSTREAM_REF: ${{ needs.resolve.outputs.ref }}
+        run: |
+          set -euo pipefail
+          bash scripts/build.sh "$UPSTREAM_REF"
+
+      - name: Show summary
+        run: |
+          set -euo pipefail
+          echo "### Build summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| field | value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| upstream ref | \`${{ needs.resolve.outputs.ref }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| upstream commit | \`${{ needs.resolve.outputs.sha }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| go version | \`${{ env.GO_VERSION }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| sha256 | \`$(cut -d' ' -f1 dist/*.tar.gz.sha256)\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Verification passed: static aarch64, all 3 Termux patches present." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: termux-build
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: [resolve, build]
+    if: needs.resolve.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: termux-build
+          path: dist
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REF: ${{ needs.resolve.outputs.ref }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          tar="$(ls dist/*.tar.gz | head -n1)"
+          sum="${tar}.sha256"
+          tarball="$(basename "$tar")"
+          sha256="$(cut -d' ' -f1 "$sum")"
+
+          {
+            echo "Termux build of [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) \`$REF\`."
+            echo ""
+            echo "Built from upstream commit \`$SHA\` with Go \`$GO_VERSION\`."
+            echo ""
+            echo "### Patches applied"
+            echo ""
+            echo "| target | reason |"
+            echo "|---|---|"
+            echo "| \`net/dnsclient_unix.go\` | resolver path -> \`\$PREFIX/etc/resolv.conf\` (Android has no writable \`/etc\`) |"
+            echo "| \`crypto/x509/root_linux.go\` | CA bundle -> \`\$PREFIX/etc/tls/cert.pem\` |"
+            echo "| \`os/file_unix.go\` | temp dir -> \`\$PREFIX/tmp\` (no \`/tmp\` on Android) |"
+            echo ""
+            echo "### Artifact"
+            echo ""
+            echo '```'
+            echo "sha256  $sha256"
+            echo "        $tarball"
+            echo '```'
+            echo ""
+            echo "Install:"
+            echo ""
+            echo '```'
+            echo "curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/install.sh | bash"
+            echo '```'
+          } > notes.md
+
+          gh release create "$REF" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$REF (Termux aarch64)" \
+            --notes-file notes.md \
+            "$tar" "$sum"
+
+      - name: Upload release notes for snapshot step
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: notes.md
+
+  snapshot:
+    name: commit patched source
+    needs: [resolve, build, release]
+    if: |
+      needs.resolve.outputs.skip != 'true' &&
+      (inputs.commit_snapshot == true || github.event_name != 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Regenerate overlay snapshot
+        run: |
+          set -euo pipefail
+          mkdir -p snapshot
+          python3 scripts/make-overlay.py \
+            --goroot "$(go env GOROOT)" \
+            --prefix "$TERMUX_PREFIX" \
+            --out snapshot/overlay
+          printf '%s\n' "${{ needs.resolve.outputs.ref }}" > snapshot/UPSTREAM_REF
+          printf '%s\n' "${{ needs.resolve.outputs.sha }}" > snapshot/UPSTREAM_SHA
+
+      - name: Commit
+        env:
+          REF: ${{ needs.resolve.outputs.ref }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add snapshot
+          if git diff --cached --quiet; then
+            echo "snapshot unchanged"
+            exit 0
+          fi
+          git commit -m "snapshot: patched stdlib for ${REF}"
+          git push

@@ -1,0 +1,12 @@
+# build/working dirs
+.work/
+dist/
+__pycache__/
+*.pyc
+
+# local binaries
+cli-proxy-api
+cli-proxy-api.prev
+
+# NOTE: snapshot/ is intentionally NOT ignored - CI commits the patched
+# stdlib tree there so every published build is auditable.
