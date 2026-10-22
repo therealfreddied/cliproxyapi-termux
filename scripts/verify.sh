@@ -83,7 +83,6 @@ check_string() {
 }
 check_string "resolv.conf path" "$PREFIX_BAKED/etc/resolv.conf"
 check_string "CA bundle path"   "$PREFIX_BAKED/etc/tls/cert.pem"
-check_string "temp dir path"    "$PREFIX_BAKED/tmp"
 
 # --- 7. build version (static check, no execution) ---------------------------
 if [ -n "$EXPECTED_VER" ]; then

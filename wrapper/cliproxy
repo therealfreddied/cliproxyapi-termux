@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/data/data/com.termux/files/usr/bin/env bash
 # cliproxy - Termux launcher with self-update for CLIProxyAPI.
 #
 # Checks this repo's releases for a newer build on launch, offers to update,

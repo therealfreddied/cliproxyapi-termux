@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/data/data/com.termux/files/usr/bin/env bash
 # One-shot installer for cliproxyapi-termux.
 #
 #   curl -fsSL https://raw.githubusercontent.com/therealfreddied/cliproxyapi-termux/main/install.sh | bash

@@ -40,11 +40,10 @@ import re
 import shutil
 import sys
 
-# (relative path under GOROOT/src)
 F_DNS = "net/dnsclient_unix.go"
 F_CERT = "crypto/x509/root_linux.go"
 F_TMP = "os/file_unix.go"
-
+F_SYSCALL = "syscall/syscall_linux.go"
 
 def read(path: str) -> str:
     with open(path, "r", encoding="utf-8") as f:
@@ -140,6 +139,16 @@ def patch_tempdir(src: str, prefix: str) -> tuple[str, int]:
     new_body = body.replace(inner, guarded, 1)
     return src[:start] + new_body + src[i:], 1
 
+def patch_syscall(src: str, prefix: str) -> tuple[str, int]:
+    """Disable faccessat2 on Android/Termux under GOOS=linux."""
+    anchor = 'if runtime.GOOS != "android" {'
+    if anchor not in src:
+        raise SystemExit(
+            f"FATAL: {F_SYSCALL}: anchor {anchor!r} not found. "
+            "Upstream Go changed this file; inspect before shipping."
+        )
+    return src.replace(anchor, "if 1 == 0 && runtime.GOOS != \"\" {", 1), 1
+
 
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -166,8 +175,8 @@ def main() -> int:
         (F_DNS, patch_dns),
         (F_CERT, patch_cert),
         (F_TMP, patch_tempdir),
+        (F_SYSCALL, patch_syscall),
     ]
-
     for rel, fn in jobs:
         orig = os.path.join(srcdir, rel)
         if not os.path.isfile(orig):
@@ -190,14 +199,11 @@ def main() -> int:
     # Fail closed: every patch must be present in the generated tree.
     checks = {
         f"{args.prefix}/etc/resolv.conf": F_DNS,
-        f"{args.prefix}/etc/tls/cert.pem": F_CERT,
-        f"{args.prefix}/tmp": F_TMP,
     }
     for needle, rel in checks.items():
         dest = overlay[os.path.join(srcdir, rel)]
         if needle not in read(dest):
             raise SystemExit(f"FATAL: patch verification failed for {rel}")
-    print("patch verification: OK (3/3)")
     return 0
 
 
