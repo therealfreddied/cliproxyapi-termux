@@ -171,7 +171,7 @@ verify_binary() {
 }
 
 do_update() {
-  local want="${1:-}" force="${2:-}"
+  local want="${1:-}" force="${2:-}" explicit="${3:-}"
   local tag tmp stage tarball sha
 
   command -v curl >/dev/null || die "curl is required"
@@ -199,9 +199,15 @@ do_update() {
         [Nn]*) say "skipped"; return 0 ;;
       esac
     else
-      # Non-interactive (nohup/screen): never surprise-update a running service.
-      dim "non-interactive: skipping update (use --yes to force)"
-      return 0
+      # Non-interactive (nohup/screen/service): never surprise-update a
+      # running service on a routine launch check. An EXPLICIT --update is
+      # different - the user asked for it, so it is already consent.
+      if [ -n "$explicit" ]; then
+        dim "non-interactive: proceeding (explicit --update)"
+      else
+        dim "non-interactive: skipping update (use --yes to force)"
+        return 0
+      fi
     fi
   fi
 
@@ -333,7 +339,10 @@ main() {
     version)  printf '%s\n' "$(installed_version)"; exit 0 ;;
     rollback) rollback; exit 0 ;;
     uninstall) uninstall; exit 0 ;;
-    update)   do_update "$(latest_release)" ""; exit $? ;;
+    update)   # An explicit `--update` is the user's consent; do not then
+              # skip for being non-interactive. Prompting still happens when
+              # attached to a TTY and --yes was not given.
+              do_update "$(latest_release)" "" explicit; exit $? ;;
     update-force) do_update "$(latest_release)" force; exit $? ;;
   esac
 
