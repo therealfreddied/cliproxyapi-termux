@@ -107,7 +107,8 @@ start_server() {
   if is_running; then
     say "server is already running"
     return 0
-  }
+  fi
+
   mkdir -p "$CONFIG_DIR"
   [ -f "$CONFIG" ] || warn "no config at $CONFIG"
   say "starting server in background..."
@@ -234,8 +235,8 @@ do_update() {
   if [ "$cur" = "$want" ] && [ -z "$force" ]; then
     say "already up to date ($cur)"
     return 0
-  }
-  say "update available: $cur -> $want"
+  fi
+
   local tmp; tmp="$(mktemp -d "$TMPBASE/cliproxy-update.XXXXXX")" || die "mktemp failed"
   trap 'rm -rf "$tmp"' RETURN
 
